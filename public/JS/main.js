@@ -38,6 +38,7 @@ async function importV(path) {
   return import(url);
 }
 
+const { fetchResponse: fetch, validateEvents, parseCoordinate } = await importV("./utils/data.js");
 const { REGLAGES, validerReglages } = await importV("./reglages.js");
 validerReglages();
 const MODULES = REGLAGES.fichiers.modules;
@@ -49,7 +50,7 @@ const { initPanelScrollProgress } = modules.panelScroll;
 const { dates, strings, security, bottomChart, eventsRenderer, legend, countryFilters, playback, i18n, tutorial, geojsonLevels, mapRendering, nearbyNavigation } = modules;
 const { parseDateFlexible, getEventTime, formatDateFR, startOfDayUTC, startOfDay, endOfDay } = dates;
 const { normalizeType } = strings;
-const { escapeHtml } = security;
+const { escapeHtml, getSafeHttpUrl } = security;
 const { BottomChart } = bottomChart;
 const { EventsRenderer } = eventsRenderer;
 const { LegendUI } = legend;
@@ -87,11 +88,11 @@ const PLAYBACK_CUES = REGLAGES.lecture.reperes;
 
 const COUNTRY_BORDER_STYLES = REGLAGES.stylesGeojson.frontieresParPays;
 const DEFAULT_BORDER_STYLE = REGLAGES.stylesGeojson.contour;
-const TYPE_COLORS = Object.fromEntries(REGLAGES.categories.map(category => [category.cle, category.couleur]));
-const TYPE_CONFIG = Object.fromEntries(REGLAGES.categories.map(category => [category.cle, { slug: category.slug, file: category.icone }]));
-const TYPE_MAP_EN_TO_FR = Object.fromEntries(REGLAGES.categories.flatMap(category =>
+const TYPE_COLORS = Object.assign(Object.create(null), Object.fromEntries(REGLAGES.categories.map(category => [category.cle, category.couleur])));
+const TYPE_CONFIG = Object.assign(Object.create(null), Object.fromEntries(REGLAGES.categories.map(category => [category.cle, { slug: category.slug, file: category.icone }])));
+const TYPE_MAP_EN_TO_FR = Object.assign(Object.create(null), Object.fromEntries(REGLAGES.categories.flatMap(category =>
   category.valeursEntree.filter(value => value !== category.cle).map(value => [value, category.cle])
-));
+)));
 
 function getDisplayLabelForType(type, lang = currentLang) {
   const category = REGLAGES.categories.find(item => item.cle === type);
@@ -229,8 +230,8 @@ function normalizeConfiguredEvent(event) {
     auteur: pick("auteur") ?? event.auteur ?? event.author,
     country: pick("pays") ?? event.country ?? event.Country ?? event.oblast ?? event.Oblast,
     geojson: pick("nomGeojson") ?? event.geojson ?? event.Geojson,
-    lat: Number(pick("latitude") ?? event.lat),
-    lng: Number(pick("longitude") ?? event.lng),
+    lat: parseCoordinate(pick("latitude") ?? event.lat, 90),
+    lng: parseCoordinate(pick("longitude") ?? event.lng, 180),
     compteur_evenements: pick("identifiant") ?? event.compteur_evenements,
     lien: pick("lien") ?? event.lien ?? event.link
   };
@@ -469,13 +470,15 @@ function setupCollapse({ btnId, bodyId, storageKey = null, defaultCollapsed = fa
 
   const load = () => {
     if (!storageKey) return defaultCollapsed;
-    const v = localStorage.getItem(storageKey);
-    if (v === null) return defaultCollapsed;
-    return v === "1";
+    try {
+      const v = localStorage.getItem(storageKey);
+      return v === null ? defaultCollapsed : v === "1";
+    } catch { return defaultCollapsed; }
   };
 
   const save = (isCollapsed) => {
-    if (storageKey) localStorage.setItem(storageKey, isCollapsed ? "1" : "0");
+    if (!storageKey) return;
+    try { localStorage.setItem(storageKey, isCollapsed ? "1" : "0"); } catch { /* Stockage désactivé dans certains contextes intégrés. */ }
   };
 
   const apply = (isCollapsed) => {
@@ -497,9 +500,6 @@ function setupCollapse({ btnId, bodyId, storageKey = null, defaultCollapsed = fa
 }
 
 
-// ========================================================
-// 7) PANNEAUX
-// ========================================================
 
 function setPanelExpanded(expanded) {
   const panel = document.getElementById("event-panel");
@@ -938,7 +938,7 @@ function buildStackedCountsByGroup({
   initRightPanelVisibleTypes();
 
   const allCats = Object.keys(TYPE_CONFIG);
-  const counts = {};
+  const counts = Object.create(null);
 
   const keyFn = (ev) => {
     if (groupBy === "villes") return ev.lieu || null;
@@ -1387,8 +1387,11 @@ function createMarkerIcon(type) {
   const cfg = TYPE_CONFIG[type];
   if (!cfg) return L.icon({ iconUrl: DEFAULT_ICON_URL, iconSize: [24, 24] });
 
+  const element = document.createElement("div");
+  element.className = "marker-icon marker-" + normalizeType(cfg.slug);
+  element.style.backgroundImage = "url(" + JSON.stringify(iconUrl(cfg.file)) + ")";
   return L.divIcon({
-    html: `<div class="marker-icon marker-${cfg.slug}" style="background-image:url('${iconUrl(cfg.file)}')"></div>`,
+    html: element,
     className: "",
     iconSize: [36, 36],
     popupAnchor: [0, -12]
@@ -1829,7 +1832,9 @@ function applyConfiguredControls() {
   document.querySelectorAll(".rsf-cartography-link").forEach((link, index) => {
     const card = REGLAGES.cartesLiees[index];
     if (!card) return;
-    link.href = card.href;
+    const safeHref = getSafeHttpUrl(card.href);
+    if (safeHref) link.href = safeHref;
+    else { link.removeAttribute("href"); link.hidden = true; }
     const image = link.querySelector("img");
     if (image) image.src = withV(card.image);
   });
@@ -2037,7 +2042,7 @@ async function loadEventsForLang(lang) {
   const url = withV(file);
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`Événements ${lang} : HTTP ${resp.status}`);
-  const data = (await resp.json()).map(normalizeConfiguredEvent);
+  const data = validateEvents(await resp.json(), REGLAGES.champsDonnees).map(normalizeConfiguredEvent);
 
   if (lang === "en") {
     data.forEach(ev => {
@@ -2183,6 +2188,7 @@ async function setLanguage(lang, { updateUrl = true } = {}) {
   currentLang = nextLang;
   geojsonLevelsController?.setLanguage(currentLang);
   allEvents = events;
+  selectedAuthor = null;
   selectedTypes = new Set(allEvents.map(ev => ev.type_violence));
 
   countrysDisponibles = CountryFilters.buildCountryListFromEvents(allEvents);
